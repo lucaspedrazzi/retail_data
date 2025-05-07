@@ -5,46 +5,155 @@ import pandas as pd
 from airflow.providers.google.cloud.transfers.local_to_gcs import LocalFilesystemToGCSOperator
 from airflow.providers.google.cloud.operators.bigquery import BigQueryCreateEmptyDatasetOperator
 
+from astro import sql as aql
+from astro.files import File
+from astro.sql.table import Table, Metadata
+from astro.constants import FileType
+
+from include.dbt.cosmos_config import DBT_PROJECT_CONFIG, DBT_CONFIG
+from cosmos.airflow.task_group import DbtTaskGroup
+from cosmos.constants import LoadMode
+from cosmos.config import ProjectConfig, RenderConfig
+
+from airflow.models.baseoperator import chain
+
+
 @dag(
     start_date=datetime(2024, 7, 7),
-    schedule_interval=None,
+    schedule=None,
     catchup=False,
-    tags=['retail']
+    tags=['retail'],
 )
-
-def retail_dag():
-    bucket_name = ' lucaspedrazzi-retail-data'
+def retail():
+    bucket_name = 'lucaspedrazzi-retail-data'
     @task.external_python(python='/usr/local/airflow/pandas_venv/bin/python')
-    
     def correct_csv_format():
         import pandas as pd
-        
+
+        # Correct the CSV format
+        # Read the CSV file with the correct encoding
+        # and parse the InvoiceDate column
         file_path = '/usr/local/airflow/include/datasets/online_retail.csv'
-        new_file_path = '/usr/local/airflow/include/datasets/online_retail_corrected.csv'
+        new_file_path = '/usr/local/airflow/include/datasets/online_retail_dataset.csv'
         df = pd.read_csv(file_path, encoding='ISO-8859-1')
         df['InvoiceDate'] = pd.to_datetime(df['InvoiceDate'], format='%m/%d/%y %H:%M', errors='coerce')
         df.to_csv(new_file_path, index=False)
-        
+    
+    # Upload the CSV files to GCS
     upload_retail_csv_to_gcs = LocalFilesystemToGCSOperator(
-        task_id= 'upload_retail_csv_to_gcs',
-        src = '/usr/local/airflow/include/datasets/online_retail_corrected.csv',
-        dst = 'raw/online_retail.csv',
-        bucket = bucket_name,
-        gcp_conn_id = 'gcp',
-        mime_type = 'text/csv',
+        task_id='upload_retail_csv_to_gcs',
+        src='/usr/local/airflow/include/datasets/online_retail_dataset.csv',
+        dst='raw/online_retail.csv',
+        bucket=bucket_name,
+        gcp_conn_id='gcp',
+        mime_type='text/csv',
     )
-    
+
+    # Upload the country CSV file to GCS
     upload_country_csv_to_gcs = LocalFilesystemToGCSOperator(
-        task_id= 'upload_retail_csv_to_gcs',
-        src = '/usr/local/airflow/include/datasets/country.csv',
-        dst = 'raw/country.csv',
-        bucket = bucket_name,
-        gcp_conn_id = 'gcp',
-        mime_type = 'text/csv',
+        task_id='upload_country_csv_to_gcs',
+        src='/usr/local/airflow/include/datasets/country.csv',
+        dst='raw/country.csv',
+        bucket=bucket_name,
+        gcp_conn_id='gcp',
+        mime_type='text/csv',
+    )
+
+    # Create the retail dataset in BigQuery
+    create_retail_dataset = BigQueryCreateEmptyDatasetOperator(
+        task_id='create_retail_dataset',
+        dataset_id='retail',
+        gcp_conn_id='gcp',
     )
     
+    # Create the raw tables in BigQuery
+    retail_gcs_to_raw = aql.load_file(
+        task_id='retail_gcs_to_raw',
+        input_file=File(
+            f'gs://{bucket_name}/raw/online_retail.csv',
+            conn_id='gcp',
+            filetype=FileType.CSV,
+        ),
+        output_table=Table(
+            name='raw_invoices',
+            conn_id='gcp',
+            metadata=Metadata(schema='retail')
+        ),
+        use_native_support=True,
+        native_support_kwargs={
+            "encoding": "ISO_8859_1",
+        }
+    )
+
+    # Create the raw country table in BigQuery
+    country_gcs_to_raw = aql.load_file(
+        task_id='country_gcs_to_raw',
+        input_file=File(
+            f'gs://{bucket_name}/raw/country.csv',
+            conn_id='gcp',
+            filetype=FileType.CSV,
+        ),
+        output_table=Table(
+            name='raw_country',
+            conn_id='gcp',
+            metadata=Metadata(schema='retail')
+        ),
+        use_native_support=True,
+        native_support_kwargs={
+            "encoding": "ISO_8859_1",
+        }
+    )
+
+    @task.external_python(python='/usr/local/airflow/soda_venv/bin/python')
+    def check_load(scan_name='check_load', checks_subpath='sources'):
+        from include.soda.check_function import check
+
+        return check(scan_name, checks_subpath)
     
+    transform = DbtTaskGroup(
+        group_id='transform',
+        project_config=DBT_PROJECT_CONFIG,
+        profile_config=DBT_CONFIG,
+        render_config=RenderConfig(
+            load_method=LoadMode.DBT_LS,
+            select=['path:models/transform']
+        )
+    )
+
+    @task.external_python(python='/usr/local/airflow/soda_venv/bin/python')
+    def check_transform(scan_name='check_transform', checks_subpath='transform'):
+        from include.soda.check_function import check
+
+        return check(scan_name, checks_subpath)
     
-    retail_dag()
-    
-    
+    report = DbtTaskGroup(
+        group_id='report',
+        project_config=DBT_PROJECT_CONFIG,
+        profile_config=DBT_CONFIG,
+        render_config=RenderConfig(
+            load_method=LoadMode.DBT_LS,
+            select=['path:models/report']
+        )
+    )
+
+    @task.external_python(python='/usr/local/airflow/soda_venv/bin/python')
+    def check_report(scan_name='check_report', checks_subpath='report'):
+        from include.soda.check_function import check
+
+        return check(scan_name, checks_subpath)
+
+    chain(
+        correct_csv_format(),
+        upload_retail_csv_to_gcs,
+        upload_country_csv_to_gcs,
+        create_retail_dataset,
+        retail_gcs_to_raw,
+        country_gcs_to_raw,
+        check_load(),
+        transform,
+        check_transform(),
+        report,
+        check_report()
+    )
+
+retail()
